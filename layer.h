@@ -138,6 +138,234 @@ public:
 };
 
 // ============================================================
+//  Dropout Layer
+//
+//  Eğitimde: her nöronu p olasılıkla sıfırla,
+//            kalanları 1/(1-p) ile scale et  ← inverted dropout
+//  Testte:   hiçbir şey yapma, girdini olduğu gibi geçir
+//
+//  Neden inverted dropout?
+//  Scaling'i eğitime taşırsak test sırasında ağa dokunmamıza gerek kalmaz.
+//  Klasik dropout test'te scale yapardı — inverted bunun tersini yapar.
+// ============================================================
+class DropoutLayer : public Layer {
+    double p;          // sıfırlama olasılığı (örn: 0.5)
+    bool   training;   // true → dropout aktif, false → pass-through
+    Matrix mask;       // backprop için önbelleklenen maske
+    std::mt19937 rng;
+
+public:
+    explicit DropoutLayer(double drop_prob = 0.5)
+        : p(drop_prob), training(true), mask(1, 1),
+          rng(std::random_device{}())
+    {
+        if (p <= 0.0 || p >= 1.0)
+            throw std::invalid_argument("Dropout p (0, 1) aralığında olmalı");
+    }
+
+    void set_training(bool mode) { training = mode; }
+
+    // x: (features x batch)
+    Matrix forward(const Matrix& x) override {
+        if (!training) return x;   // test modunda dokunma
+
+        // Bernoulli maske: 1/(1-p) ile scale edilmiş
+        std::bernoulli_distribution dist(1.0 - p);
+        double scale = 1.0 / (1.0 - p);
+
+        mask = Matrix(x.rows, x.cols);
+        for (auto& v : mask.data)
+            v = dist(rng) ? scale : 0.0;
+
+        return x.hadamard(mask);
+    }
+
+    // Gradyan aynı maske üzerinden geçer
+    Matrix backward(const Matrix& grad_out) override {
+        if (!training) return grad_out;
+        return grad_out.hadamard(mask);
+    }
+
+    std::string name() const override {
+        return "Dropout(p=" + std::to_string(p) + ")";
+    }
+};
+
+// ============================================================
+//  Batch Normalization Layer
+//
+//  Eğitimde:
+//    μ  = mean(x)           batch ortalaması
+//    σ² = var(x)            batch varyansı
+//    x̂  = (x - μ) / √(σ²+ε)   normalize
+//    y  = γ * x̂ + β         scale + shift  (öğrenilebilir)
+//
+//  Testte:
+//    running_mean ve running_var kullanılır (eğitimde EMA ile biriktirilir)
+//
+//  Backprop:
+//    dγ = sum(grad * x̂)
+//    dβ = sum(grad)
+//    dx = (1/N) * γ/σ * (N*grad - sum(grad) - x̂*sum(grad*x̂))
+//
+//  Neden BatchNorm kullanılır?
+//  - Her katmanın girdi dağılımını sabit tutar (internal covariate shift azalır)
+//  - Daha yüksek learning rate kullanmayı mümkün kılar
+//  - Hafif bir regularization etkisi vardır
+// ============================================================
+class BatchNormLayer : public Layer {
+    int    features;      // normalize edilecek boyut (satır sayısı)
+    double eps;           // sayısal kararlılık için küçük sabit
+    double momentum;      // running stats için EMA katsayısı
+    bool   training;
+
+    // Öğrenilebilir parametreler
+    Matrix gamma;         // scale  (features x 1), başlangıç: 1
+    Matrix beta;          // shift  (features x 1), başlangıç: 0
+    Matrix dgamma, dbeta; // gradyanlar
+
+    // Test için biriktirilen istatistikler
+    Matrix running_mean;
+    Matrix running_var;
+
+    // Backprop için önbellek
+    Matrix x_hat;         // normalize edilmiş x
+    Matrix x_centered;    // x - mean
+    Matrix std_inv;       // 1 / sqrt(var + eps)  (features x 1)
+    int    batch_size;
+
+public:
+    explicit BatchNormLayer(int features, double eps = 1e-5, double momentum = 0.1)
+        : features(features), eps(eps), momentum(momentum), training(true),
+          gamma(Matrix::ones(features, 1)),
+          beta(Matrix::zeros(features, 1)),
+          dgamma(Matrix::zeros(features, 1)),
+          dbeta(Matrix::zeros(features, 1)),
+          running_mean(Matrix::zeros(features, 1)),
+          running_var(Matrix::ones(features, 1)),
+          x_hat(1, 1), x_centered(1, 1),
+          std_inv(Matrix::ones(features, 1)),
+          batch_size(1)
+    {}
+
+    void set_training(bool mode) { training = mode; }
+
+    // x: (features x batch)  →  y: (features x batch)
+    Matrix forward(const Matrix& x) override {
+        batch_size = x.cols;
+
+        Matrix mean(features, 1);   // μ  (features x 1)
+        Matrix var(features, 1);    // σ² (features x 1)
+
+        if (training) {
+            // Batch ortalaması: her feature için batch boyunca ortalama
+            for (int i = 0; i < features; i++) {
+                double s = 0.0;
+                for (int j = 0; j < batch_size; j++) s += x.at(i, j);
+                mean.at(i, 0) = s / batch_size;
+            }
+
+            // Batch varyansı
+            for (int i = 0; i < features; i++) {
+                double s = 0.0;
+                for (int j = 0; j < batch_size; j++) {
+                    double d = x.at(i, j) - mean.at(i, 0);
+                    s += d * d;
+                }
+                var.at(i, 0) = s / batch_size;
+            }
+
+            // Running stats güncelle (EMA)
+            for (int i = 0; i < features; i++) {
+                running_mean.at(i, 0) = (1 - momentum) * running_mean.at(i, 0)
+                                      + momentum * mean.at(i, 0);
+                running_var.at(i, 0)  = (1 - momentum) * running_var.at(i, 0)
+                                      + momentum * var.at(i, 0);
+            }
+        } else {
+            // Test modunda running stats kullan
+            mean = running_mean;
+            var  = running_var;
+        }
+
+        // std_inv = 1 / sqrt(σ² + ε)
+        std_inv = var.apply([this](double v){ return 1.0 / std::sqrt(v + eps); });
+
+        // x_centered = x - μ  (broadcast)
+        x_centered = Matrix(features, batch_size);
+        for (int i = 0; i < features; i++)
+            for (int j = 0; j < batch_size; j++)
+                x_centered.at(i, j) = x.at(i, j) - mean.at(i, 0);
+
+        // x̂ = x_centered * std_inv  (broadcast)
+        x_hat = Matrix(features, batch_size);
+        for (int i = 0; i < features; i++)
+            for (int j = 0; j < batch_size; j++)
+                x_hat.at(i, j) = x_centered.at(i, j) * std_inv.at(i, 0);
+
+        // y = γ * x̂ + β  (broadcast)
+        Matrix out(features, batch_size);
+        for (int i = 0; i < features; i++)
+            for (int j = 0; j < batch_size; j++)
+                out.at(i, j) = gamma.at(i, 0) * x_hat.at(i, j) + beta.at(i, 0);
+
+        return out;
+    }
+
+    // grad_out: (features x batch)  →  grad_input: (features x batch)
+    Matrix backward(const Matrix& grad_out) override {
+        int N = batch_size;
+
+        // dγ = sum_batch(grad * x̂)
+        // dβ = sum_batch(grad)
+        for (int i = 0; i < features; i++) {
+            double dg = 0.0, db = 0.0;
+            for (int j = 0; j < N; j++) {
+                dg += grad_out.at(i, j) * x_hat.at(i, j);
+                db += grad_out.at(i, j);
+            }
+            dgamma.at(i, 0) = dg;
+            dbeta.at(i, 0)  = db;
+        }
+
+        // dx̂ = grad * γ
+        Matrix dx_hat(features, N);
+        for (int i = 0; i < features; i++)
+            for (int j = 0; j < N; j++)
+                dx_hat.at(i, j) = grad_out.at(i, j) * gamma.at(i, 0);
+
+        // Tam backprop formülü (Ioffe & Szegedy, 2015):
+        // dx = (1/N) * std_inv * (N*dx̂ - sum(dx̂) - x̂*sum(dx̂*x̂))
+        Matrix dx(features, N);
+        for (int i = 0; i < features; i++) {
+            double sum_dxh  = 0.0;
+            double sum_dxhx = 0.0;
+            for (int j = 0; j < N; j++) {
+                sum_dxh  += dx_hat.at(i, j);
+                sum_dxhx += dx_hat.at(i, j) * x_hat.at(i, j);
+            }
+            for (int j = 0; j < N; j++) {
+                dx.at(i, j) = std_inv.at(i, 0) / N *
+                    (N * dx_hat.at(i, j) - sum_dxh
+                     - x_hat.at(i, j) * sum_dxhx);
+            }
+        }
+
+        return dx;
+    }
+
+    // γ ve β'yı optimizer ile güncelle
+    void update(Optimizer* opt, const std::string& id) override {
+        opt->step(gamma, dgamma, id + "_gamma");
+        opt->step(beta,  dbeta,  id + "_beta");
+    }
+
+    std::string name() const override {
+        return "BatchNorm(" + std::to_string(features) + ")";
+    }
+};
+
+// ============================================================
 //  Loss functions (standalone, not a layer)
 // ============================================================
 struct MSELoss {
