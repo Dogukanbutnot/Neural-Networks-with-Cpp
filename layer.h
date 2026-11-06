@@ -1,6 +1,7 @@
 #pragma once
 #include "matrix.h"
 #include "optimizer.h"
+#include "serialization.h"
 #include <memory>
 #include <string>
 #include <cmath>
@@ -18,6 +19,14 @@ public:
     // Parametresi olmayan katmanlar (ReLU vb.) bu metodu override etmez.
     virtual void update(Optimizer* /*opt*/, const std::string& /*id*/) {}
 
+    // Ag, en bastaki katman icin false verir: girisin gradyanini kimse
+    // kullanmaz, o yuzden hesaplamak bosa is olur. (Sadece DenseLayer'da etkili.)
+    virtual void set_compute_input_grad(bool /*on*/) {}
+
+    // Model kaydetme/yukleme: parametresi olan katmanlar override eder
+    virtual void save(std::ostream& /*os*/) const {}
+    virtual void load(std::istream& /*is*/) {}
+
     virtual std::string name() const = 0;
 };
 
@@ -31,8 +40,12 @@ class DenseLayer : public Layer {
     Matrix W, b;        // ağırlıklar ve bias
     Matrix dW, db;      // gradyanlar (backward'dan gelir)
     Matrix input_cache; // backprop için girdi önbelleği
+    bool   need_dx = true;   // false: backward giris gradyanini hesaplamaz
 
 public:
+    void set_compute_input_grad(bool on) override { need_dx = on; }
+    const Matrix& weights() const { return W; }   // olcum/teshis icin
+
     DenseLayer(int in_size, int out_size)
         : in_size(in_size), out_size(out_size),
           W(Matrix::random(out_size, in_size, 0.0, std::sqrt(2.0 / in_size))),
@@ -55,9 +68,12 @@ public:
 
     // grad_out: (out x batch)  →  grad_input: (in x batch)
     Matrix backward(const Matrix& grad_out) override {
-        int batch = grad_out.cols;
-        dW = grad_out * input_cache.transpose() * (1.0 / batch);
-        db = grad_out.sum_cols() * (1.0 / batch);
+        // NOT: Kayip fonksiyonlarinin gradyani zaten 1/batch ile bolunmus gelir
+        // (ortalama kayip). Burada tekrar bolmek gradyani 1/batch^2 yapar;
+        // gradyan kontrol testi (gradcheck_test.cpp) bu hatayi yakalamisti.
+        dW = grad_out * input_cache.transpose();
+        db = grad_out.sum_cols();
+        if (!need_dx) return Matrix(1, 1);   // kullanilmayacak, bos is yapma
         return W.transpose() * grad_out;
     }
 
@@ -66,6 +82,15 @@ public:
     void update(Optimizer* opt, const std::string& id) override {
         opt->step(W, dW, id + "_W");
         opt->step(b, db, id + "_b");
+    }
+
+    void save(std::ostream& os) const override {
+        write_matrix(os, W);
+        write_matrix(os, b);
+    }
+    void load(std::istream& is) override {
+        read_into(is, W, name() + ".W");
+        read_into(is, b, name() + ".b");
     }
 
     std::string name() const override {
@@ -84,8 +109,20 @@ public:
     ReLULayer() : mask(1, 1) {}
 
     Matrix forward(const Matrix& x) override {
-        mask = x.apply([](double v){ return v > 0.0 ? 1.0 : 0.0; });
-        return x.apply([](double v){ return std::max(0.0, v); });
+        // Tek gecis, std::function cagrisi yok (eleman basina fonksiyon cagrisi
+        // CNN'lerdeki buyuk aktivasyon matrislerinde zamanin ~%19'unu aliyordu)
+        mask = Matrix(x.rows, x.cols);
+        Matrix out(x.rows, x.cols);
+        const size_t n = x.data.size();
+        const double* xs = x.data.data();
+        double* m = mask.data.data();
+        double* o = out.data.data();
+        for (size_t i = 0; i < n; i++) {
+            const double v = xs[i];
+            m[i] = v > 0.0 ? 1.0 : 0.0;
+            o[i] = std::max(0.0, v);
+        }
+        return out;
     }
 
     Matrix backward(const Matrix& grad_out) override {
@@ -155,9 +192,11 @@ class DropoutLayer : public Layer {
     std::mt19937 rng;
 
 public:
-    explicit DropoutLayer(double drop_prob = 0.5)
+    // seed verilmezse her calistirmada farkli; deney tekrari icin seed ver
+    explicit DropoutLayer(double drop_prob = 0.5,
+                          unsigned seed = std::random_device{}())
         : p(drop_prob), training(true), mask(1, 1),
-          rng(std::random_device{}())
+          rng(seed)
     {
         if (p <= 0.0 || p >= 1.0)
             throw std::invalid_argument("Dropout p (0, 1) aralığında olmalı");
@@ -360,9 +399,73 @@ public:
         opt->step(beta,  dbeta,  id + "_beta");
     }
 
+    // gamma/beta ogrenilen parametreler; running_mean/var test modunda
+    // kullanildigi icin onlar da kaydedilmeli
+    void save(std::ostream& os) const override {
+        write_matrix(os, gamma);
+        write_matrix(os, beta);
+        write_matrix(os, running_mean);
+        write_matrix(os, running_var);
+    }
+    void load(std::istream& is) override {
+        read_into(is, gamma,        name() + ".gamma");
+        read_into(is, beta,         name() + ".beta");
+        read_into(is, running_mean, name() + ".running_mean");
+        read_into(is, running_var,  name() + ".running_var");
+    }
+
     std::string name() const override {
         return "BatchNorm(" + std::to_string(features) + ")";
     }
+};
+
+// ============================================================
+//  Softmax Layer  (sütun bazlı: her sütun = bir örnek)
+//
+//  s_i = exp(z_i - max(z)) / sum_k exp(z_k - max(z))
+//
+//  max çıkarmak sonucu değiştirmez ama exp'in taşmasını engeller.
+//
+//  Backprop (Jacobian-vektör çarpımı):
+//    dL/dz_i = s_i * ( g_i - sum_k g_k * s_k )     g = dL/ds
+//  Tam Jacobian matrisini kurmadan, her sütun için O(C) hesaplanır.
+// ============================================================
+class SoftmaxLayer : public Layer {
+    Matrix output_cache;
+
+public:
+    SoftmaxLayer() : output_cache(1, 1) {}
+
+    // z: (classes x batch)
+    Matrix forward(const Matrix& z) override {
+        Matrix s(z.rows, z.cols);
+        for (int j = 0; j < z.cols; j++) {
+            double mx = z.at(0, j);
+            for (int i = 1; i < z.rows; i++) mx = std::max(mx, z.at(i, j));
+            double sum = 0.0;
+            for (int i = 0; i < z.rows; i++) {
+                s.at(i, j) = std::exp(z.at(i, j) - mx);
+                sum += s.at(i, j);
+            }
+            for (int i = 0; i < z.rows; i++) s.at(i, j) /= sum;
+        }
+        output_cache = s;
+        return s;
+    }
+
+    Matrix backward(const Matrix& grad_out) override {
+        Matrix dz(grad_out.rows, grad_out.cols);
+        for (int j = 0; j < grad_out.cols; j++) {
+            double dot = 0.0;   // sum_k g_k * s_k
+            for (int i = 0; i < grad_out.rows; i++)
+                dot += grad_out.at(i, j) * output_cache.at(i, j);
+            for (int i = 0; i < grad_out.rows; i++)
+                dz.at(i, j) = output_cache.at(i, j) * (grad_out.at(i, j) - dot);
+        }
+        return dz;
+    }
+
+    std::string name() const override { return "Softmax"; }
 };
 
 // ============================================================
@@ -398,5 +501,27 @@ struct BCELoss {
         return (p - target).hadamard(
             denom.apply([](double v){ return 1.0 / v; })
         ) * (1.0 / pred.cols);
+    }
+};
+
+struct CrossEntropyLoss {
+    // pred: softmax çıktısı (classes x batch), target: one-hot (classes x batch)
+    // L = -(1/batch) * sum_örnek sum_sınıf  y * log(p)
+    static double compute(const Matrix& pred, const Matrix& target) {
+        Matrix p = pred.clip(1e-12, 1.0);
+        double loss = 0.0;
+        for (int i = 0; i < p.rows * p.cols; i++)
+            loss -= target.data[i] * std::log(p.data[i]);
+        return loss / pred.cols;
+    }
+
+    // dL/dp = -y / p / batch   (SoftmaxLayer.backward ile birlikte
+    //  zincirleme: dL/dz = (p - y) / batch  sonucunu verir)
+    static Matrix gradient(const Matrix& pred, const Matrix& target) {
+        Matrix p = pred.clip(1e-12, 1.0);
+        Matrix g(p.rows, p.cols);
+        for (int i = 0; i < p.rows * p.cols; i++)
+            g.data[i] = -target.data[i] / p.data[i];
+        return g * (1.0 / pred.cols);
     }
 };

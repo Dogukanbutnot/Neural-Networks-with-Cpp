@@ -34,9 +34,14 @@ public:
     Matrix hadamard(const Matrix& other) const; // element-wise multiply
     Matrix apply(std::function<double(double)> func) const;
 
+    // Hangi carpim cekirdegi secildi: "AVX2" | "SSE2" | "scalar"
+    static const char* matmul_backend();
+
     // Static factories
     static Matrix zeros(int rows, int cols);
     static Matrix ones(int rows, int cols);
+    // Rastgele baslatma icin tohum (varsayilan 42). Ag kurulmadan ONCE cagir.
+    static void set_seed(unsigned seed);
     static Matrix random(int rows, int cols, double mean = 0.0, double stddev = 1.0);
     static Matrix from_vector(const std::vector<double>& v); // column vector
 
